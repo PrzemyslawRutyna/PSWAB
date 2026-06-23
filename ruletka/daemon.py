@@ -1,45 +1,26 @@
-"""Tryb demona -- uruchomienie serwera jako procesu w tle (double fork).
-
-Mechanizm dziala wylacznie na systemach uniksowych (wymaga ``os.fork`` oraz
-``os.setsid``).  Po odlaczeniu od terminala standardowe deskryptory
-przekierowywane sa do /dev/null; zdarzenia trafiaja do logow systemowych
-(patrz ``server.setup_logging``).
-"""
+"""Tryb demona: odlaczenie procesu w tle technika double-fork (tylko Unix)."""
 
 import os
 import sys
 
 
 def daemonize():
-    """Przeksztalca biezacy proces w demona technika podwojnego fork().
-
-    Kroki:
-      1. fork -- rodzic konczy, dziecko trwa (nie jest liderem grupy),
-      2. setsid -- nowa sesja, odlaczenie od terminala sterujacego,
-      3. drugi fork -- gwarancja, ze proces nie przejmie terminala,
-      4. chdir('/') oraz umask(0),
-      5. przekierowanie stdin/stdout/stderr do /dev/null.
-    """
+    """Double fork + setsid; std fd -> /dev/null."""
     if not hasattr(os, "fork"):
         raise RuntimeError(
-            "Tryb demona wymaga systemu uniksowego (os.fork niedostepny). "
-            "Uruchom serwer na Linux/macOS (np. w WSL lub maszynie wirtualnej)."
-        )
+            "Tryb demona wymaga systemu uniksowego (os.fork niedostepny).")
 
-    # --- pierwszy fork ---
     if os.fork() > 0:
-        os._exit(0)            # rodzic konczy dzialanie
+        os._exit(0)            # rodzic konczy
 
-    os.setsid()                # nowa sesja, brak terminala sterujacego
+    os.setsid()                # nowa sesja, brak terminala
 
-    # --- drugi fork ---
     if os.fork() > 0:
         os._exit(0)            # konczy lidera sesji
 
     os.chdir("/")
     os.umask(0)
 
-    # Przekierowanie standardowych strumieni do /dev/null.
     sys.stdout.flush()
     sys.stderr.flush()
     devnull = os.open(os.devnull, os.O_RDWR)

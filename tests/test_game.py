@@ -1,8 +1,4 @@
-"""Testy modulu logiki gry (ruletka.game).
-
-Sprawdzaja liczbe rund, deterministyczne zachowanie strzalu przy podanym
-generatorze oraz przyblizone prawdopodobienstwo 1/6 na probie losowej.
-"""
+"""Testy logiki gry: liczba rund i strzal 1/6."""
 
 import random
 import unittest
@@ -11,8 +7,6 @@ from ruletka import game
 
 
 class FakeRng:
-    """Generator zwracajacy z gory ustalona wartosc z randint()."""
-
     def __init__(self, value):
         self.value = value
         self.calls = []
@@ -24,14 +18,12 @@ class FakeRng:
 
 class TestRoundsFor(unittest.TestCase):
     def test_single_player(self):
-        # Wyjatek: jeden gracz -> jedna runda.
         self.assertEqual(game.rounds_for(1), 1)
 
     def test_zero_or_negative(self):
         self.assertEqual(game.rounds_for(0), 1)
 
     def test_multiplayer(self):
-        # Liczba rund = liczba graczy - 1.
         self.assertEqual(game.rounds_for(2), 1)
         self.assertEqual(game.rounds_for(3), 2)
         self.assertEqual(game.rounds_for(6), 5)
@@ -40,7 +32,6 @@ class TestRoundsFor(unittest.TestCase):
 
 class TestIsFatalShot(unittest.TestCase):
     def test_fatal_when_one(self):
-        # Trafienie tylko gdy wylosowano 1 (jeden naboj na 6 komor).
         self.assertTrue(game.is_fatal_shot(FakeRng(1)))
 
     def test_empty_for_two_to_six(self):
@@ -54,17 +45,14 @@ class TestIsFatalShot(unittest.TestCase):
         self.assertEqual(game.CHAMBERS, 6)
 
     def test_probability_is_one_sixth(self):
-        # Statystyczny test poprawnosci przy ustalonym ziarnie (stabilny).
         rng = random.Random(12345)
         n = 60000
         fatal = sum(1 for _ in range(n) if game.is_fatal_shot(rng))
-        ratio = fatal / n
-        self.assertAlmostEqual(ratio, game.PROB_FATAL, delta=0.01)
+        self.assertAlmostEqual(fatal / n, game.PROB_FATAL, delta=0.01)
 
 
 class TestConstants(unittest.TestCase):
     def test_single_win_streak(self):
-        # Tryb solo: wygrana po 5 kolejnych pustych strzalach.
         self.assertEqual(game.SINGLE_WIN_STREAK, 5)
 
     def test_prob_fatal_value(self):

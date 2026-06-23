@@ -1,14 +1,4 @@
-"""Testy integracyjne serwera (ruletka.server).
-
-Uruchamiaja prawdziwy serwer na loopbacku (127.0.0.1, port dynamiczny) i lacza
-sie z nim surowymi gniazdami TCP, sprawdzajac:
-  * walidacje pseudonimu (pusty, za dlugi, zajety, brak JOIN),
-  * pelny przebieg gry dla dwoch graczy (START -> SHOT -> ELIMINATED ->
-    ROUND_END -> WINNER -> GAME_OVER) oraz spojnosc stanu wspoldzielonego.
-
-Testy nie korzystaja z multicast (uruchamiane sa tylko watki TCP), dzieki
-czemu sa stabilne takze poza Linuksem.
-"""
+"""Testy integracyjne serwera na loopbacku: walidacja nicka i pelna gra."""
 
 import socket
 import threading
@@ -18,7 +8,6 @@ from ruletka import protocol, server
 
 
 def _start_server(with_lobby, **overrides):
-    """Tworzy serwer na 127.0.0.1 i uruchamia wymagane watki TCP."""
     params = dict(
         host="127.0.0.1", tcp_port=0, name="test",
         mcast_group=protocol.DEFAULT_MCAST_GROUP, mcast_port=0,
@@ -26,7 +15,7 @@ def _start_server(with_lobby, **overrides):
     )
     params.update(overrides)
     srv = server.GameServer(**params)
-    srv.tcp_socks = srv._make_listening_sockets()      # ustala srv.tcp_port
+    srv.tcp_socks = srv._make_listening_sockets()       # ustala srv.tcp_port
     threading.Thread(target=srv._accept_loop, daemon=True).start()
     if with_lobby:
         threading.Thread(target=srv._lobby_controller, daemon=True).start()
@@ -40,7 +29,6 @@ def _connect(port):
 
 
 def _recv(sock):
-    """Odbiera jeden komunikat (typ, value); None przy rozlaczeniu/timeout."""
     try:
         return protocol.recv_message(sock)
     except socket.timeout:
@@ -48,7 +36,6 @@ def _recv(sock):
 
 
 def _drain_until_game_over(sock, sink):
-    """Czyta komunikaty az do GAME_OVER, dopisujac (typ, value) do *sink*."""
     sock.settimeout(10)
     while True:
         msg = _recv(sock)
@@ -74,8 +61,7 @@ class TestNickValidation(unittest.TestCase):
         self.assertEqual(mtype, protocol.T_ERROR)
         self.assertEqual(protocol.decode_error(value)[0], protocol.ERR_NICK)
 
-        # To samo polaczenie pozwala ponowic z poprawnym pseudonimem.
-        s.sendall(protocol.encode_join("Bob"))
+        s.sendall(protocol.encode_join("Bob"))      # ponowienie na tym samym gniezdzie
         mtype, value = _recv(s)
         self.assertEqual(mtype, protocol.T_JOIN_ACK)
         self.assertEqual(protocol.decode_join_ack(value)[1], "Bob")
@@ -104,7 +90,6 @@ class TestNickValidation(unittest.TestCase):
     def test_first_message_must_be_join(self):
         s = _connect(self.port)
         self.addCleanup(s.close)
-        # Komunikat inny niz JOIN -> blad protokolu, polaczenie utrzymane.
         s.sendall(protocol.encode_info("nie-join"))
         mtype, value = _recv(s)
         self.assertEqual(mtype, protocol.T_ERROR)
@@ -113,7 +98,6 @@ class TestNickValidation(unittest.TestCase):
 
 class TestFullGameTwoPlayers(unittest.TestCase):
     def test_two_players_play_to_winner(self):
-        # Start natychmiast po dolaczeniu 2 graczy (max_players=2).
         srv = _start_server(with_lobby=True, lobby_timeout=2, max_players=2)
         self.addCleanup(srv.shutdown)
         port = srv.tcp_port
@@ -129,7 +113,6 @@ class TestFullGameTwoPlayers(unittest.TestCase):
         id_b = protocol.decode_join_ack(_recv(sb)[1])[0]
         self.assertNotEqual(id_a, id_b)
 
-        # Czytamy oba strumienie rownolegle az do GAME_OVER.
         msgs_a, msgs_b = [], []
         ta = threading.Thread(target=_drain_until_game_over, args=(sa, msgs_a))
         tb = threading.Thread(target=_drain_until_game_over, args=(sb, msgs_b))
@@ -140,13 +123,11 @@ class TestFullGameTwoPlayers(unittest.TestCase):
             types = [m[0] for m in msgs]
             self.assertIn(protocol.T_START, types, "%s: brak START" % label)
             self.assertIn(protocol.T_GAME_OVER, types, "%s: brak GAME_OVER" % label)
-            # Dwoch graczy -> jedna runda -> dokladnie jedna eliminacja.
             self.assertEqual(types.count(protocol.T_ELIMINATED), 1,
                              "%s: oczekiwano 1 eliminacji" % label)
             self.assertEqual(types.count(protocol.T_WINNER), 1,
                              "%s: oczekiwano 1 zwyciezcy" % label)
 
-        # Zwyciezca to gracz, ktory nie zostal wyeliminowany.
         winner = next(protocol.decode_winner(v) for t, v in msgs_a
                       if t == protocol.T_WINNER)
         eliminated = next(protocol.decode_eliminated(v) for t, v in msgs_a
@@ -157,8 +138,6 @@ class TestFullGameTwoPlayers(unittest.TestCase):
 
 class TestSinglePlayer(unittest.TestCase):
     def test_single_player_game_finishes(self):
-        # Jeden gracz: start po uplywie krotkiej poczekalni; gra konczy sie
-        # zwyciestwem (5 pustych) lub eliminacja -- zawsze GAME_OVER.
         srv = _start_server(with_lobby=True, lobby_timeout=1, max_players=1)
         self.addCleanup(srv.shutdown)
         port = srv.tcp_port

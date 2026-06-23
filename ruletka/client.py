@@ -1,14 +1,4 @@
-"""Modul klienta gry ,,Rosyjska Ruletka''.
-
-Odpowiedzialnosci:
-  * wyszukanie serwera w sieci lokalnej (multicast: wyslanie DISCOVER i
-    odbior ANNOUNCE) albo rozwiazanie nazwy hosta przez DNS (getaddrinfo),
-  * nawiazanie polaczenia unicast TCP i wprowadzenie pseudonimu,
-  * odbior i prezentacja komunikatow: stanu gry, strzalow, eliminacji,
-    zwyciezcy i konca gry.
-
-Uruchomienie:  python3 -m ruletka.client [opcje]
-"""
+"""Klient gry "Rosyjska Ruletka": wyszukiwanie (multicast/DNS) + rozgrywka."""
 
 import argparse
 import socket
@@ -21,22 +11,8 @@ from .protocol import (DEFAULT_MCAST_GROUP, DEFAULT_MCAST_GROUP6,
                        DEFAULT_MCAST_PORT, DEFAULT_TCP_PORT)
 
 
-# ---------------------------------------------------------------------------
-# Wyszukiwanie serwera (multicast) -- IPv4 oraz IPv6
-# ---------------------------------------------------------------------------
 def discover_servers(group, mcast_port, timeout, iface=None):
-    """Wysyla DISCOVER i zbiera odpowiedzi ANNOUNCE przez *timeout* sekund.
-
-    Rodzina adresow wynika z zapisu grupy (':' -> IPv6, np. ff15::1).  Zwraca
-    liste krotek ``(nazwa, host, port_tcp)``, gdzie *host* jest gotowy do
-    polaczenia (dla adresow IPv6 link-local zawiera identyfikator interfejsu,
-    np. ``fe80::1%eth0``).
-
-    *iface* (adres IP karty dla IPv4 lub nazwa np. ``eth0`` dla IPv6) wskazuje
-    interfejs multicastu -- konieczny w sieciach bez trasy domyslnej
-    (np. VirtualBox host-only).  Gdy wyslanie DISCOVER zawiedzie
-    (ENETUNREACH), funkcja nie przerywa -- nadal nasluchuje cyklicznych ANNOUNCE.
-    """
+    """DISCOVER + zbieranie ANNOUNCE; zwraca [(nazwa, host, port)] (IPv4/IPv6)."""
     family = socket.AF_INET6 if ":" in group else socket.AF_INET
 
     def v6_index():
@@ -52,9 +28,8 @@ def discover_servers(group, mcast_port, timeout, iface=None):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except OSError:
             pass
-    # Dolaczamy do grupy, aby odbierac takze cykliczne ANNOUNCE serwera.
     try:
-        s.bind(("", mcast_port))
+        s.bind(("", mcast_port))                # czlonkostwo w grupie
         if family == socket.AF_INET6:
             mreq = socket.inet_pton(socket.AF_INET6, group) + struct.pack("@I", v6_index())
             opt = getattr(socket, "IPV6_JOIN_GROUP",
@@ -66,13 +41,10 @@ def discover_servers(group, mcast_port, timeout, iface=None):
             s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
                          socket.inet_aton(group) + iface_bin)
     except OSError:
-        # Gdy port zajety, mozemy nadal wyslac DISCOVER i sluchac odpowiedzi
-        # unicast na efemerycznym porcie.
-        s.close()
+        s.close()                               # port zajety -> sam DISCOVER
         s = socket.socket(family, socket.SOCK_DGRAM)
 
-    # Wskazanie interfejsu wyjsciowego multicastu (gdy podano).
-    try:
+    try:                                        # interfejs wyjsciowy multicastu
         if family == socket.AF_INET6:
             s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
             if iface:
@@ -106,9 +78,8 @@ def discover_servers(group, mcast_port, timeout, iface=None):
         if parsed and parsed[0] == protocol.T_ANNOUNCE:
             port, name = protocol.decode_announce(parsed[1])
             host = addr[0]
-            # Dla IPv6 link-local zachowujemy identyfikator interfejsu (scope).
             if family == socket.AF_INET6 and len(addr) >= 4 and addr[3]:
-                if "%" not in host:
+                if "%" not in host:             # scope IPv6 link-local
                     host = "%s%%%d" % (host, addr[3])
             found[(host, port)] = name
     s.close()
@@ -116,10 +87,7 @@ def discover_servers(group, mcast_port, timeout, iface=None):
 
 
 def resolve(host, port):
-    """Rozwiazuje nazwe hosta (DNS) -- IPv4 i IPv6 przez socket.getaddrinfo().
-
-    Zwraca liste krotek ``(rodzina, ip)`` znalezionych adresow.
-    """
+    """DNS przez getaddrinfo (AF_UNSPEC); zwraca [(rodzina, ip)]."""
     infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
     out = []
     seen = set()
@@ -131,13 +99,10 @@ def resolve(host, port):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Prezentacja komunikatow
-# ---------------------------------------------------------------------------
 class GamePrinter:
     def __init__(self, my_id):
         self.my_id = my_id
-        self.roster = {}        # id -> pseudonim
+        self.roster = {}            # id -> pseudonim
 
     def name(self, pid):
         return self.roster.get(pid, "gracz#%d" % pid)
@@ -146,7 +111,7 @@ class GamePrinter:
         return " (TY)" if pid == self.my_id else ""
 
     def handle(self, mtype, value):
-        """Obsluga jednego komunikatu. Zwraca False gdy gra sie zakonczyla."""
+        """Obsluga komunikatu; False gdy koniec gry."""
         if mtype == protocol.T_INFO:
             print("  [i] " + protocol.decode_info(value))
 
@@ -198,11 +163,8 @@ class GamePrinter:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Logika klienta
-# ---------------------------------------------------------------------------
 def choose_server(args):
-    """Zwraca (ip, port) serwera na podstawie argumentow lub wyszukiwania."""
+    """Zwraca (host, port) z argumentow (DNS) albo z wyszukiwania multicast."""
     if args.host:
         print("Rozwiazywanie nazwy '%s' (DNS, IPv4/IPv6)..." % args.host)
         try:
@@ -213,8 +175,7 @@ def choose_server(args):
         for family, ip in addrs:
             label = "IPv6" if family == socket.AF_INET6 else "IPv4"
             print("  -> %s (%s)" % (ip, label))
-        # Zwracamy nazwe -- create_connection sprobuje kolejno wszystkich adresow.
-        return args.host, args.port
+        return args.host, args.port             # create_connection sprobuje wszystkich
 
     print("Wyszukiwanie serwerow w sieci (multicast %s:%d, %ds)..."
           % (args.group, args.mcast_port, args.discover_timeout))
@@ -241,7 +202,7 @@ def choose_server(args):
 
 
 def join_game(sock, nick):
-    """Wysyla JOIN i obsluguje walidacje pseudonimu. Zwraca id albo None."""
+    """JOIN z walidacja pseudonimu (ponawianie); zwraca id albo None."""
     while True:
         sock.sendall(protocol.encode_join(nick))
         msg = protocol.recv_message(sock)
@@ -280,24 +241,22 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Klient sieciowej gry 'Rosyjska Ruletka'.")
     p.add_argument("--host", default=None,
-                   help="adres lub nazwa serwera (pomija wyszukiwanie multicast)")
+                   help="adres/nazwa serwera (pomija multicast)")
     p.add_argument("--port", type=int, default=DEFAULT_TCP_PORT,
                    help="port TCP serwera (domyslnie %d)" % DEFAULT_TCP_PORT)
     p.add_argument("--nick", default=None,
                    help="pseudonim gracza (max %d znakow)" % protocol.NICK_MAX)
     p.add_argument("--group", default=DEFAULT_MCAST_GROUP,
-                   help="grupa multicast: IPv4 %s lub IPv6 np. %s"
+                   help="grupa multicast (IPv4 %s / IPv6 %s)"
                         % (DEFAULT_MCAST_GROUP, DEFAULT_MCAST_GROUP6))
     p.add_argument("--mcast-port", type=int, default=DEFAULT_MCAST_PORT,
                    help="port multicast (domyslnie %d)" % DEFAULT_MCAST_PORT)
     p.add_argument("--iface", default=None,
-                   help="interfejs multicast: adres IP karty (IPv4) lub nazwa "
-                        "np. eth0 (IPv6). Wymagany w sieci host-only / bez trasy "
-                        "domyslnej")
+                   help="interfejs multicast: IP karty (IPv4) lub nazwa np. eth0 (IPv6)")
     p.add_argument("--discover-timeout", type=float, default=3.0,
-                   help="czas wyszukiwania serwerow w sekundach (domyslnie 3)")
+                   help="czas wyszukiwania serwerow [s]")
     p.add_argument("--list", action="store_true",
-                   help="tylko wyszukaj i wypisz serwery, nie dolaczaj")
+                   help="tylko wypisz wykryte serwery")
     return p.parse_args(argv)
 
 

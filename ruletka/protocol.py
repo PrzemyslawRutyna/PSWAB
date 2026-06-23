@@ -1,35 +1,20 @@
-"""Modul protokolu (TLV) -- wspolny dla klienta i serwera.
-
-Wszystkie komunikaty kodowane sa binarnie w formacie TLV:
-
-    +--------+----------+-----------------+
-    | Type   | Length   | Value           |
-    | 1 bajt | 2 bajty  | N bajtow        |
-    +--------+----------+-----------------+
-
-Naglowek pakowany jest funkcja ``struct.pack`` w sieciowej kolejnosci bajtow
-(big-endian, format ``!BH``).  Pole Length okresla dlugosc czesci Value
-(0..65535).  Pojedyncze datagramy UDP (multicast) niosa dokladnie jeden
-komunikat TLV; po stronie TCP komunikaty czytane sa strumieniowo.
-"""
+"""Binarny protokol TLV: typ (1B) + dlugosc (2B) + wartosc (NB), big-endian."""
 
 import struct
 
-# ---------------------------------------------------------------------------
-# Typy komunikatow (pole Type)
-# ---------------------------------------------------------------------------
-T_ANNOUNCE = 0x01    # serwer -> multicast : [port:2][nazwa]
-T_DISCOVER = 0x02    # klient -> multicast : [] (prosba o rozglos)
-T_JOIN = 0x10        # klient -> serwer    : [pseudonim utf-8]
-T_JOIN_ACK = 0x11    # serwer -> klient    : [id:1][pseudonim]
-T_START = 0x12       # serwer -> klient    : [rundy:1][gracze:1] + roster
-T_SHOT = 0x13        # serwer -> klient    : [runda:1][id:1][wynik:1]
-T_ELIMINATED = 0x14  # serwer -> klient    : [id:1]
-T_ROUND_END = 0x15   # serwer -> klient    : [runda:1][pozostali:1]
-T_WINNER = 0x16      # serwer -> klient    : [id:1]
-T_GAME_OVER = 0x17   # serwer -> klient    : []
-T_ERROR = 0x18       # serwer -> klient    : [kod:1][tekst utf-8]
-T_INFO = 0x19        # serwer -> klient    : [tekst utf-8]
+# typy komunikatow (1. bajt ramki); w komentarzu uklad pola wartosci
+T_ANNOUNCE = 0x01    # [port:2][nazwa]   serwer -> multicast
+T_DISCOVER = 0x02    # []                klient -> multicast
+T_JOIN = 0x10        # [pseudonim]
+T_JOIN_ACK = 0x11    # [id:1][pseudonim]
+T_START = 0x12       # [rundy:1][gracze:1] + roster
+T_SHOT = 0x13        # [runda:1][id:1][wynik:1]
+T_ELIMINATED = 0x14  # [id:1]
+T_ROUND_END = 0x15   # [runda:1][pozostali:1]
+T_WINNER = 0x16      # [id:1]
+T_GAME_OVER = 0x17   # []
+T_ERROR = 0x18       # [kod:1][tekst]
+T_INFO = 0x19        # [tekst]
 
 TYPE_NAMES = {
     T_ANNOUNCE: "ANNOUNCE", T_DISCOVER: "DISCOVER", T_JOIN: "JOIN",
@@ -38,44 +23,35 @@ TYPE_NAMES = {
     T_GAME_OVER: "GAME_OVER", T_ERROR: "ERROR", T_INFO: "INFO",
 }
 
-# Wyniki strzalu (pole wynik w komunikacie SHOT)
-RESULT_EMPTY = 0     # pusta komora -- gracz przezyl
-RESULT_FATAL = 1     # smiertelny strzal -- gracz wyeliminowany
+# wynik strzalu
+RESULT_EMPTY = 0     # pusto
+RESULT_FATAL = 1     # smiertelny
 
-# Kody bledow (komunikat ERROR)
-ERR_PROTOCOL = 0     # naruszenie protokolu
-ERR_NICK = 1         # bledny pseudonim
-ERR_BUSY = 2         # gra juz trwa / brak miejsc
+# kody bledow
+ERR_PROTOCOL = 0
+ERR_NICK = 1
+ERR_BUSY = 2
 
-# Domyslne parametry adresacji -- wspolne dla klienta i serwera.
-DEFAULT_TCP_PORT = 50000             # unicast TCP (rozgrywka)
-DEFAULT_MCAST_GROUP = "239.0.0.1"    # grupa multicast IPv4
-DEFAULT_MCAST_GROUP6 = "ff15::1"     # grupa multicast IPv6 (zasieg site-local)
-DEFAULT_MCAST_PORT = 50001           # multicast (wyszukiwanie uslugi)
+# domyslna adresacja (wspolna dla klienta i serwera)
+DEFAULT_TCP_PORT = 50000
+DEFAULT_MCAST_GROUP = "239.0.0.1"    # IPv4
+DEFAULT_MCAST_GROUP6 = "ff15::1"     # IPv6 (site-local)
+DEFAULT_MCAST_PORT = 50001
 
-# Naglowek TLV: 1 bajt typ + 2 bajty dlugosc, big-endian.
-_HEADER = struct.Struct("!BH")
+_HEADER = struct.Struct("!BH")       # typ + dlugosc, big-endian
 HEADER_SIZE = _HEADER.size
 MAX_VALUE = 0xFFFF
 NICK_MAX = 12
 
 
-# ---------------------------------------------------------------------------
-# Kodowanie / dekodowanie ramki
-# ---------------------------------------------------------------------------
 def encode(mtype, value=b""):
-    """Zwraca bajty pojedynczej ramki TLV."""
     if len(value) > MAX_VALUE:
         raise ValueError("Wartosc TLV przekracza %d bajtow" % MAX_VALUE)
     return _HEADER.pack(mtype, len(value)) + value
 
 
 def recv_exact(sock, n):
-    """Czyta dokladnie *n* bajtow z gniazda TCP.
-
-    Zwraca ``None`` jezeli polaczenie zostalo zamkniete przed odebraniem
-    kompletu danych.
-    """
+    """Czyta dokladnie n bajtow; None gdy polaczenie zamkniete."""
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -86,10 +62,7 @@ def recv_exact(sock, n):
 
 
 def recv_message(sock):
-    """Odbiera jeden komunikat TLV z gniazda strumieniowego (TCP).
-
-    Zwraca krotke ``(typ, value)`` albo ``None`` przy rozlaczeniu.
-    """
+    """Jeden komunikat TLV z TCP: (typ, value) albo None przy rozlaczeniu."""
     head = recv_exact(sock, HEADER_SIZE)
     if head is None:
         return None
@@ -103,7 +76,7 @@ def recv_message(sock):
 
 
 def parse_datagram(data):
-    """Parsuje pojedynczy datagram UDP zawierajacy jedna ramke TLV."""
+    """Jeden komunikat TLV z datagramu UDP."""
     if len(data) < HEADER_SIZE:
         return None
     mtype, length = _HEADER.unpack(data[:HEADER_SIZE])
@@ -113,17 +86,13 @@ def parse_datagram(data):
     return mtype, value
 
 
-# ---------------------------------------------------------------------------
-# Konstruktory poszczegolnych komunikatow
-# ---------------------------------------------------------------------------
 def encode_announce(tcp_port, name):
     return encode(T_ANNOUNCE, struct.pack("!H", tcp_port) + name.encode("utf-8"))
 
 
 def decode_announce(value):
     (port,) = struct.unpack("!H", value[:2])
-    name = value[2:].decode("utf-8", "replace")
-    return port, name
+    return port, value[2:].decode("utf-8", "replace")
 
 
 def encode_discover():
@@ -143,13 +112,11 @@ def encode_join_ack(pid, nick):
 
 
 def decode_join_ack(value):
-    pid = value[0]
-    nick = value[1:].decode("utf-8", "replace")
-    return pid, nick
+    return value[0], value[1:].decode("utf-8", "replace")
 
 
 def encode_start(num_rounds, roster):
-    """roster: lista krotek ``(id, pseudonim)`` graczy bioracych udzial."""
+    """roster: lista (id, pseudonim)."""
     parts = [struct.pack("!BB", num_rounds, len(roster))]
     for pid, nick in roster:
         nb = nick.encode("utf-8")
@@ -176,7 +143,7 @@ def encode_shot(rnd, pid, result):
 
 
 def decode_shot(value):
-    return struct.unpack("!BBB", value)  # (runda, id, wynik)
+    return struct.unpack("!BBB", value)             # (runda, id, wynik)
 
 
 def encode_eliminated(pid):
@@ -192,7 +159,7 @@ def encode_round_end(rnd, survivors):
 
 
 def decode_round_end(value):
-    return struct.unpack("!BB", value)  # (runda, pozostali)
+    return struct.unpack("!BB", value)              # (runda, pozostali)
 
 
 def encode_winner(pid):
@@ -212,9 +179,7 @@ def encode_error(code, text):
 
 
 def decode_error(value):
-    code = value[0]
-    text = value[1:].decode("utf-8", "replace")
-    return code, text
+    return value[0], value[1:].decode("utf-8", "replace")
 
 
 def encode_info(text):

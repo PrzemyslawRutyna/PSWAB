@@ -1,9 +1,4 @@
-"""Testy modulu protokolu TLV (ruletka.protocol).
-
-Sprawdzaja poprawnosc kodowania/dekodowania kazdego typu komunikatu
-(round-trip), budowe naglowka oraz odbior strumieniowy z gniazda TCP
-(recv_message / recv_exact) i parsowanie datagramow UDP.
-"""
+"""Testy protokolu TLV: round-trip, naglowek, odbior strumieniowy, datagram."""
 
 import struct
 import unittest
@@ -12,11 +7,7 @@ from ruletka import protocol as p
 
 
 class FakeSocket:
-    """Atrapa gniazda zwracajaca dane w porcjach o rozmiarze ``chunk``.
-
-    Pozwala przetestowac recv_exact, ktory musi skladac komunikat z wielu
-    wywolan recv(). Po wyczerpaniu danych zwraca b'' (jak zamkniete polaczenie).
-    """
+    """Atrapa gniazda zwracajaca dane w porcjach o rozmiarze chunk."""
 
     def __init__(self, data, chunk=4096):
         self.data = bytes(data)
@@ -34,7 +25,6 @@ class FakeSocket:
 
 class TestHeader(unittest.TestCase):
     def test_header_layout(self):
-        # 1 bajt typ + 2 bajty dlugosc = 3 bajty, big-endian.
         self.assertEqual(p.HEADER_SIZE, 3)
         frame = p.encode(p.T_JOIN, b"abc")
         self.assertEqual(frame[0], p.T_JOIN)
@@ -52,8 +42,6 @@ class TestHeader(unittest.TestCase):
 
 
 class TestRoundTrip(unittest.TestCase):
-    """Kazdy komunikat: encode -> parse_datagram -> decode powinno zwrocic wejscie."""
-
     def _decode(self, frame, expected_type):
         parsed = p.parse_datagram(frame)
         self.assertIsNotNone(parsed)
@@ -125,7 +113,6 @@ class TestRecvMessage(unittest.TestCase):
         self.assertEqual(p.decode_shot(value), (1, 2, p.RESULT_EMPTY))
 
     def test_byte_by_byte(self):
-        # recv_exact musi poskladac komunikat z 1-bajtowych porcji.
         frame = p.encode_join_ack(3, "Krzys")
         sock = FakeSocket(frame, chunk=1)
         mtype, value = p.recv_message(sock)
@@ -146,11 +133,9 @@ class TestRecvMessage(unittest.TestCase):
         self.assertIsNone(p.recv_message(FakeSocket(b"")))
 
     def test_truncated_header_returns_none(self):
-        # Dwa bajty zamiast trzybajtowego naglowka -> rozlaczenie.
         self.assertIsNone(p.recv_message(FakeSocket(b"\x10\x00")))
 
     def test_truncated_value_returns_none(self):
-        # Naglowek zapowiada 5 bajtow, ale danych jest mniej.
         frame = p.encode(p.T_INFO, b"hello")[:-2]
         self.assertIsNone(p.recv_message(FakeSocket(frame)))
 

@@ -1,17 +1,4 @@
-"""Modul serwera (wspolbiezny) gry ,,Rosyjska Ruletka''.
-
-Odpowiedzialnosci:
-  * nasluch unicast TCP (rozgrywka) -- kazde polaczenie w osobnym watku,
-  * cykliczne rozglaszanie uslugi w grupie multicast (ANNOUNCE) oraz
-    odpowiadanie na zapytania DISCOVER,
-  * walidacja pseudonimow i zarzadzanie lista aktywnych graczy,
-  * synchronizacja wspolnego stanu gry muteksem (threading.Lock),
-  * sterowanie rundami (logika z modulu game),
-  * logowanie zdarzen do syslog/logging,
-  * tryb demona (double fork).
-
-Uruchomienie:  python3 -m ruletka.server [opcje]
-"""
+"""Wspolbiezny serwer gry "Rosyjska Ruletka" (multicast + unicast TCP, demon)."""
 
 import argparse
 import logging
@@ -28,26 +15,21 @@ from . import daemon, game, protocol
 
 log = logging.getLogger("ruletka.server")
 
-# Domyslne parametry adresacji sa wspolne -- patrz ruletka.protocol.
-ANNOUNCE_INTERVAL = 2.0      # co ile sekund rozglaszac ANNOUNCE
-MCAST_TTL = 1                # zasieg multicast (1 = siec lokalna)
+ANNOUNCE_INTERVAL = 2.0      # s
+MCAST_TTL = 1                # zasieg
 
 
-# ---------------------------------------------------------------------------
-# Reprezentacja pojedynczego gracza / polaczenia
-# ---------------------------------------------------------------------------
 class Player:
     def __init__(self, pid, nick, conn, addr):
         self.id = pid
         self.nick = nick
         self.conn = conn
         self.addr = addr
-        self.alive = True          # czy nie zostal jeszcze wyeliminowany
-        self.connected = True      # czy gniazdo jest wciaz aktywne
+        self.alive = True
+        self.connected = True
         self._send_lock = threading.Lock()
 
     def send(self, data):
-        """Wysyla ramke do klienta; zwraca False przy bledzie gniazda."""
         with self._send_lock:
             try:
                 self.conn.sendall(data)
@@ -57,9 +39,6 @@ class Player:
                 return False
 
 
-# ---------------------------------------------------------------------------
-# Serwer gry
-# ---------------------------------------------------------------------------
 class GameServer:
     def __init__(self, host, tcp_port, name, mcast_group, mcast_port,
                  lobby_timeout, max_players, shot_delay, iface=None):
@@ -71,27 +50,23 @@ class GameServer:
         self.lobby_timeout = lobby_timeout
         self.max_players = max_players          # 0 = bez limitu
         self.shot_delay = shot_delay
-        # Interfejs multicast: dla IPv4 adres IP karty, dla IPv6 nazwa (np. eth0).
-        # Wymagany w sieciach bez trasy domyslnej (np. VirtualBox host-only).
-        self.iface = iface or None
+        self.iface = iface or None              # interfejs multicast
 
-        # --- wspolny stan gry chroniony muteksem ---
+        # wspolny stan chroniony muteksem
         self.lock = threading.Lock()
         self.players = {}                       # id -> Player
         self.next_id = 1
         self.state = "LOBBY"                    # LOBBY | RUNNING | FINISHED
 
         self.stop_event = threading.Event()
-        self.tcp_socks = []                     # gniazda nasluchu (IPv4 + IPv6)
+        self.tcp_socks = []
         self._threads = []
 
-    # -- pomocnicze operacje na wspolnym stanie -----------------------------
     def _snapshot_players(self):
         with self.lock:
             return list(self.players.values())
 
     def broadcast(self, data):
-        """Rozsyla ramke do wszystkich podlaczonych graczy (takze obserwatorow)."""
         for p in self._snapshot_players():
             if p.connected:
                 p.send(data)
@@ -106,17 +81,11 @@ class GameServer:
             if p:
                 p.alive = False
 
-    # -- gniazda TCP (unicast, dual-stack IPv4 + IPv6) ----------------------
+    # --- nasluch TCP (dual-stack) ---
     def _make_listening_sockets(self):
-        """Otwiera gniazda nasluchu dla wszystkich rodzin adresow (IPv4/IPv6).
-
-        Wykorzystuje ``getaddrinfo`` z ``AI_PASSIVE`` -- dla pustego adresu
-        zwraca wpisy wieloznaczne dla kazdej dostepnej rodziny.  Gniazda IPv6
-        ustawiane sa jako V6ONLY, dzieki czemu mozna jednoczesnie zwiazac
-        wildcard IPv4 (0.0.0.0) oraz IPv6 (::) bez konfliktu portu.
-        """
+        """Gniazda nasluchu dla IPv4 i IPv6 (getaddrinfo + AI_PASSIVE)."""
         socks = []
-        host = self.host or None                # "" -> wszystkie interfejsy
+        host = self.host or None
         chosen_port = self.tcp_port
         seen = set()
         infos = socket.getaddrinfo(host, chosen_port, socket.AF_UNSPEC,
@@ -143,8 +112,7 @@ class GameServer:
                 log.warning("Pomijam adres %s: %s", sockaddr[0], e)
                 s.close()
                 continue
-            # Po pierwszym zwiazaniu utrwalamy port (istotne gdy podano 0).
-            chosen_port = s.getsockname()[1]
+            chosen_port = s.getsockname()[1]    # utrwala port (gdy 0)
             socks.append(s)
             log.info("Nasluch TCP (unicast) na %s [%s]", s.getsockname(),
                     "IPv6" if family == socket.AF_INET6 else "IPv4")
@@ -171,21 +139,16 @@ class GameServer:
         sel.close()
 
     def _handle_client(self, conn, addr):
-        """Obsluga pojedynczego polaczenia w osobnym watku."""
         log.info("Nowe polaczenie od %s:%d", addr[0], addr[1])
         player = None
         try:
-            # Faza dolaczania: czytamy JOIN az do akceptacji pseudonimu.
             player = self._do_join(conn, addr)
             if player is None:
                 return
-
-            # Po dolaczeniu watek czyta dalej, aby wykryc rozlaczenie klienta.
+            # dalszy odczyt tylko po to, by wykryc rozlaczenie
             while not self.stop_event.is_set():
-                msg = protocol.recv_message(conn)
-                if msg is None:
+                if protocol.recv_message(conn) is None:
                     break
-                # Klient nie wysyla nic istotnego po JOIN -- ignorujemy.
         except OSError:
             pass
         finally:
@@ -198,7 +161,7 @@ class GameServer:
                 pass
 
     def _do_join(self, conn, addr):
-        """Negocjacja pseudonimu. Zwraca Player albo None."""
+        """Negocjacja pseudonimu; zwraca Player albo None."""
         while not self.stop_event.is_set():
             msg = protocol.recv_message(conn)
             if msg is None:
@@ -243,13 +206,12 @@ class GameServer:
 
         return None
 
+    # --- multicast ---
     @property
     def mcast_family(self):
-        """Rodzina adresow grupy multicast wynika z jej zapisu (':' -> IPv6)."""
         return socket.AF_INET6 if ":" in self.mcast_group else socket.AF_INET
 
     def _v6_iface_index(self):
-        """Indeks interfejsu IPv6 z nazwy (np. 'eth0') albo 0 = domyslny."""
         if not self.iface:
             return 0
         try:
@@ -258,11 +220,6 @@ class GameServer:
             return 0
 
     def _join_multicast(self, sock):
-        """Dolacza gniazdo do grupy multicast (IPv4 lub IPv6).
-
-        Gdy podano ``--iface``, czlonkostwo zakladane jest na konkretnym
-        interfejsie (konieczne w sieciach bez trasy domyslnej, np. host-only).
-        """
         if self.mcast_family == socket.AF_INET6:
             group_bin = socket.inet_pton(socket.AF_INET6, self.mcast_group)
             mreq = group_bin + struct.pack("@I", self._v6_iface_index())
@@ -277,11 +234,6 @@ class GameServer:
                             group_bin + iface_bin)
 
     def _set_multicast_iface(self, sock, fam):
-        """Wskazuje interfejs wyjsciowy dla wysylanego multicastu (jezeli podano).
-
-        Bez tego, w sieci bez trasy domyslnej, ``sendto`` na adres grupy konczy
-        sie bledem ENETUNREACH ('Network is unreachable').
-        """
         if not self.iface:
             return
         if fam == socket.AF_INET6:
@@ -291,7 +243,6 @@ class GameServer:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                             socket.inet_aton(self.iface))
 
-    # -- multicast: rozglaszanie ANNOUNCE -----------------------------------
     def _announce_loop(self):
         fam = self.mcast_family
         s = socket.socket(fam, socket.SOCK_DGRAM)
@@ -315,7 +266,7 @@ class GameServer:
                 s.sendto(packet, dest)
                 warned = False
             except OSError as e:
-                if not warned:                  # logujemy raz, nie zalewamy logu
+                if not warned:                  # log raz
                     log.warning("Blad rozglaszania ANNOUNCE: %s. Podpowiedz: w "
                                 "sieci host-only podaj --iface <ip-karty> albo "
                                 "lacz klienta bezposrednio (--host <adres>).", e)
@@ -323,7 +274,6 @@ class GameServer:
             self.stop_event.wait(ANNOUNCE_INTERVAL)
         s.close()
 
-    # -- multicast: odpowiadanie na DISCOVER --------------------------------
     def _discover_loop(self):
         fam = self.mcast_family
         s = socket.socket(fam, socket.SOCK_DGRAM)
@@ -353,14 +303,13 @@ class GameServer:
             if parsed and parsed[0] == protocol.T_DISCOVER:
                 log.info("DISCOVER od %s -> odsylam ANNOUNCE", addr[0])
                 try:
-                    s.sendto(announce, addr)   # odpowiedz unicast
+                    s.sendto(announce, addr)    # unicast
                 except OSError:
                     pass
         s.close()
 
-    # -- sterowanie poczekalnia i startem gry -------------------------------
+    # --- poczekalnia i start ---
     def _lobby_controller(self):
-        # Czekamy na pierwszego gracza.
         while not self.stop_event.is_set():
             with self.lock:
                 n = len(self.players)
@@ -392,7 +341,7 @@ class GameServer:
 
         try:
             self._run_game(active)
-        except Exception:                       # noqa: BLE001
+        except Exception:
             log.exception("Blad w trakcie rozgrywki")
         finally:
             with self.lock:
@@ -401,7 +350,7 @@ class GameServer:
             log.info("Gra zakonczona")
             self.stop_event.set()
 
-    # -- rozgrywka ----------------------------------------------------------
+    # --- rozgrywka ---
     def _nick(self, pid):
         with self.lock:
             p = self.players.get(pid)
@@ -424,7 +373,7 @@ class GameServer:
             self._run_multi(active, num_rounds)
 
     def _run_single(self, pid):
-        """Tryb jednoosobowy: wygrana po SINGLE_WIN_STREAK pustych strzalach."""
+        """Solo: wygrana po SINGLE_WIN_STREAK pustych strzalach."""
         streak = 0
         while streak < game.SINGLE_WIN_STREAK and not self.stop_event.is_set():
             fatal = game.is_fatal_shot()
@@ -438,7 +387,7 @@ class GameServer:
                 self.set_dead(pid)
                 self.broadcast(protocol.encode_eliminated(pid))
                 log.info("Gracz '%s' przegral w trybie solo", self._nick(pid))
-                return                          # przegrana -- brak zwyciezcy
+                return
             streak += 1
 
         self.broadcast(protocol.encode_winner(pid))
@@ -446,7 +395,7 @@ class GameServer:
                 self._nick(pid), game.SINGLE_WIN_STREAK)
 
     def _run_multi(self, active, num_rounds):
-        """Tryb wieloosobowy: kazda runda eliminuje jednego gracza."""
+        """Wielu graczy: kazda runda eliminuje jednego."""
         for rnd in range(1, num_rounds + 1):
             active = self._prune_disconnected(active)
             if len(active) <= 1:
@@ -482,7 +431,6 @@ class GameServer:
             log.info("Zwyciezca: '%s'", self._nick(winner))
 
     def _prune_disconnected(self, active):
-        """Usuwa z listy aktywnych graczy, ktorzy sie rozlaczyli."""
         result = []
         for pid in active:
             with self.lock:
@@ -495,7 +443,7 @@ class GameServer:
                 log.info("Gracz id=%d rozlaczony -- usuniety z rozgrywki", pid)
         return result
 
-    # -- cykl zycia serwera -------------------------------------------------
+    # --- cykl zycia ---
     def serve_forever(self):
         self.tcp_socks = self._make_listening_sockets()
         targets = [self._accept_loop, self._announce_loop,
@@ -522,17 +470,14 @@ class GameServer:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Konfiguracja logowania (syslog / plik / stderr)
-# ---------------------------------------------------------------------------
 def setup_logging(daemonized, log_file):
+    """Logowanie: syslog + opcjonalny plik + konsola (gdy nie demon)."""
     root = logging.getLogger("ruletka")
     root.setLevel(logging.INFO)
     root.handlers.clear()
     fmt = logging.Formatter("ruletka[%(process)d] %(name)s: %(message)s")
 
-    # 1) Logi systemowe (syslog) -- preferowane na systemach uniksowych.
-    for address in ("/dev/log", "/var/run/syslog"):
+    for address in ("/dev/log", "/var/run/syslog"):     # syslog
         if os.path.exists(address):
             try:
                 h = logging.handlers.SysLogHandler(address=address)
@@ -542,53 +487,45 @@ def setup_logging(daemonized, log_file):
             except OSError:
                 pass
 
-    # 2) Opcjonalny plik logu.
     if log_file:
         fh = logging.FileHandler(log_file)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s ruletka[%(process)d] %(name)s: %(message)s"))
         root.addHandler(fh)
 
-    # 3) Konsola -- tylko gdy serwer nie jest demonem.
     if not daemonized:
         sh = logging.StreamHandler()
         sh.setFormatter(logging.Formatter("%(asctime)s %(name)s: %(message)s"))
         root.addHandler(sh)
 
-    if not root.handlers:                       # awaryjnie
+    if not root.handlers:
         root.addHandler(logging.StreamHandler())
 
 
-# ---------------------------------------------------------------------------
-# Punkt wejscia
-# ---------------------------------------------------------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Serwer sieciowej gry 'Rosyjska Ruletka'.")
     p.add_argument("--host", default="",
-                   help="adres nasluchu TCP (domyslnie puste = wszystkie "
-                        "interfejsy IPv4 i IPv6)")
+                   help="adres nasluchu TCP (puste = IPv4 i IPv6)")
     p.add_argument("--port", type=int, default=protocol.DEFAULT_TCP_PORT,
-                   help="port TCP rozgrywki (domyslnie %d)" % protocol.DEFAULT_TCP_PORT)
+                   help="port TCP (domyslnie %d)" % protocol.DEFAULT_TCP_PORT)
     p.add_argument("--name", default=socket.gethostname(),
-                   help="nazwa serwera rozglaszana w multicast")
+                   help="nazwa rozglaszana w multicast")
     p.add_argument("--group", default=protocol.DEFAULT_MCAST_GROUP,
-                   help="grupa multicast: IPv4 %s lub IPv6 np. %s"
+                   help="grupa multicast (IPv4 %s / IPv6 %s)"
                         % (protocol.DEFAULT_MCAST_GROUP, protocol.DEFAULT_MCAST_GROUP6))
     p.add_argument("--mcast-port", type=int, default=protocol.DEFAULT_MCAST_PORT,
                    help="port multicast (domyslnie %d)" % protocol.DEFAULT_MCAST_PORT)
     p.add_argument("--iface", default=None,
-                   help="interfejs multicast: adres IP karty (IPv4) lub nazwa "
-                        "np. eth0 (IPv6). Wymagany w sieci host-only / bez trasy "
-                        "domyslnej")
+                   help="interfejs multicast: IP karty (IPv4) lub nazwa np. eth0 (IPv6)")
     p.add_argument("--lobby-timeout", type=int, default=15,
-                   help="czas poczekalni od 1. gracza w sekundach (domyslnie 15)")
+                   help="poczekalnia od 1. gracza [s]")
     p.add_argument("--max-players", type=int, default=0,
-                   help="start od razu po N graczach (0 = bez limitu)")
+                   help="start po N graczach (0 = bez limitu)")
     p.add_argument("--shot-delay", type=float, default=1.0,
-                   help="odstep miedzy strzalami w sekundach (domyslnie 1.0)")
+                   help="odstep miedzy strzalami [s]")
     p.add_argument("--daemon", action="store_true",
-                   help="uruchom jako demon (tryb w tle, tylko Unix)")
+                   help="tryb demona (Unix)")
     p.add_argument("--log-file", default=None,
                    help="dodatkowy plik logu")
     return p.parse_args(argv)
@@ -598,10 +535,10 @@ def main(argv=None):
     args = parse_args(argv)
 
     if args.daemon:
-        daemon.daemonize()                      # double fork (Unix)
+        daemon.daemonize()
 
     setup_logging(args.daemon, args.log_file)
-    random.seed()                               # rozne wyniki w kazdym procesie
+    random.seed()
 
     server = GameServer(
         host=args.host, tcp_port=args.port, name=args.name,
