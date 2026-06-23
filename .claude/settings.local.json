@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"import pypdf; print\\('pypdf available'\\)\")",
-      "Bash(python -c \"import PyPDF2; print\\('PyPDF2 available'\\)\")",
-      "Bash(python -c \"import fitz; print\\('pymupdf available'\\)\")"
-    ]
-  }
-}
