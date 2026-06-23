@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- Logi i pliki tymczasowe aplikacji ---
+*.log
+.server.pid
+
+# --- Narzedzia Claude Code / lokalne ---
+.claude/
+CLAUDE.md
+.cursor/
+
+# --- Edytory / system ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

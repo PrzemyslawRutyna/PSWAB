@@ -18,6 +18,7 @@ MCAST_PORT  ?= 50001
 IFACE       ?=
 NICK        ?= gracz
 LOBBY       ?= 15
+MAXP        ?= 0
 SHOT_DELAY  ?= 1.0
 LOG         ?= /tmp/ruletka.log
 REMOTE_DIR  ?= ~/ruletka-game
@@ -32,8 +33,9 @@ help: ## Pokaz dostepne polecenia
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  %-12s %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Zmienne: PYTHON PORT GROUP MCAST_PORT NICK LOBBY SHOT_DELAY HOST LOG REMOTE_DIR"
-	@echo "Przyklad: make run-client HOST=192.168.1.50 NICK=Ala"
+	@echo "Zmienne: PYTHON PORT GROUP MCAST_PORT IFACE NICK LOBBY MAXP SHOT_DELAY HOST LOG"
+	@echo "Przyklad: make run-server MAXP=3   (start po dolaczeniu 3 graczy)"
+	@echo "Przyklad: make run-client HOST=192.168.56.101 NICK=Ala"
 
 # --- testy / kontrola jakosci ---------------------------------------------
 test: ## Uruchom testy jednostkowe
@@ -49,14 +51,14 @@ check: ## Kompilacja kontrolna wszystkich modulow
 # --- serwer ----------------------------------------------------------------
 run-server: ## Uruchom serwer (pierwszoplanowo, logi tez na konsole)
 	$(PYTHON) -m ruletka.server --host $(BIND) --port $(PORT) --group $(GROUP) \
-		--mcast-port $(MCAST_PORT) --lobby-timeout $(LOBBY) \
+		--mcast-port $(MCAST_PORT) --lobby-timeout $(LOBBY) --max-players $(MAXP) \
 		--shot-delay $(SHOT_DELAY) --log-file $(LOG) \
 		$(if $(strip $(IFACE)),--iface $(IFACE),)
 
 daemon: ## Uruchom serwer jako demon (tryb w tle, syslog)
 	$(PYTHON) -m ruletka.server --daemon --host $(BIND) --port $(PORT) \
 		--group $(GROUP) --mcast-port $(MCAST_PORT) --lobby-timeout $(LOBBY) \
-		--shot-delay $(SHOT_DELAY) --log-file $(LOG) \
+		--max-players $(MAXP) --shot-delay $(SHOT_DELAY) --log-file $(LOG) \
 		$(if $(strip $(IFACE)),--iface $(IFACE),)
 	@echo "Demon uruchomiony. Podglad: make logs / make follow ; status: ps aux | grep ruletka"
 
