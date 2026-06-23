@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import os
 import random
+import selectors
 import socket
 import struct
 import threading
@@ -61,7 +62,7 @@ class Player:
 # ---------------------------------------------------------------------------
 class GameServer:
     def __init__(self, host, tcp_port, name, mcast_group, mcast_port,
-                 lobby_timeout, max_players, shot_delay):
+                 lobby_timeout, max_players, shot_delay, iface=None):
         self.host = host
         self.tcp_port = tcp_port
         self.name = name
@@ -70,6 +71,9 @@ class GameServer:
         self.lobby_timeout = lobby_timeout
         self.max_players = max_players          # 0 = bez limitu
         self.shot_delay = shot_delay
+        # Interfejs multicast: dla IPv4 adres IP karty, dla IPv6 nazwa (np. eth0).
+        # Wymagany w sieciach bez trasy domyslnej (np. VirtualBox host-only).
+        self.iface = iface or None
 
         # --- wspolny stan gry chroniony muteksem ---
         self.lock = threading.Lock()
@@ -78,7 +82,7 @@ class GameServer:
         self.state = "LOBBY"                    # LOBBY | RUNNING | FINISHED
 
         self.stop_event = threading.Event()
-        self.tcp_sock = None
+        self.tcp_socks = []                     # gniazda nasluchu (IPv4 + IPv6)
         self._threads = []
 
     # -- pomocnicze operacje na wspolnym stanie -----------------------------
@@ -102,26 +106,69 @@ class GameServer:
             if p:
                 p.alive = False
 
-    # -- gniazdo TCP (unicast) ----------------------------------------------
-    def _setup_tcp(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.host, self.tcp_port))
-        s.listen(16)
-        # Jezeli podano port 0, system przydzielil go dynamicznie.
-        self.tcp_port = s.getsockname()[1]
-        self.tcp_sock = s
+    # -- gniazda TCP (unicast, dual-stack IPv4 + IPv6) ----------------------
+    def _make_listening_sockets(self):
+        """Otwiera gniazda nasluchu dla wszystkich rodzin adresow (IPv4/IPv6).
+
+        Wykorzystuje ``getaddrinfo`` z ``AI_PASSIVE`` -- dla pustego adresu
+        zwraca wpisy wieloznaczne dla kazdej dostepnej rodziny.  Gniazda IPv6
+        ustawiane sa jako V6ONLY, dzieki czemu mozna jednoczesnie zwiazac
+        wildcard IPv4 (0.0.0.0) oraz IPv6 (::) bez konfliktu portu.
+        """
+        socks = []
+        host = self.host or None                # "" -> wszystkie interfejsy
+        chosen_port = self.tcp_port
+        seen = set()
+        infos = socket.getaddrinfo(host, chosen_port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+        for family, socktype, proto, _canon, sockaddr in infos:
+            if (family, sockaddr[0]) in seen:
+                continue
+            seen.add((family, sockaddr[0]))
+            try:
+                s = socket.socket(family, socktype, proto)
+            except OSError:
+                continue
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                try:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except OSError:
+                    pass
+            bind_addr = (sockaddr[0], chosen_port) + tuple(sockaddr[2:])
+            try:
+                s.bind(bind_addr)
+                s.listen(16)
+            except OSError as e:
+                log.warning("Pomijam adres %s: %s", sockaddr[0], e)
+                s.close()
+                continue
+            # Po pierwszym zwiazaniu utrwalamy port (istotne gdy podano 0).
+            chosen_port = s.getsockname()[1]
+            socks.append(s)
+            log.info("Nasluch TCP (unicast) na %s [%s]", s.getsockname(),
+                    "IPv6" if family == socket.AF_INET6 else "IPv4")
+        if not socks:
+            raise OSError("Nie udalo sie otworzyc zadnego gniazda nasluchu TCP")
+        self.tcp_port = chosen_port
+        return socks
 
     def _accept_loop(self):
-        log.info("Nasluch TCP (unicast) na %s:%d", self.host, self.tcp_port)
+        sel = selectors.DefaultSelector()
+        for s in self.tcp_socks:
+            s.setblocking(False)
+            sel.register(s, selectors.EVENT_READ)
         while not self.stop_event.is_set():
-            try:
-                conn, addr = self.tcp_sock.accept()
-            except OSError:
-                break
-            t = threading.Thread(target=self._handle_client,
-                                 args=(conn, addr), daemon=True)
-            t.start()
+            for key, _ in sel.select(timeout=0.5):
+                try:
+                    conn, addr = key.fileobj.accept()
+                except OSError:
+                    continue
+                conn.setblocking(True)
+                t = threading.Thread(target=self._handle_client,
+                                     args=(conn, addr), daemon=True)
+                t.start()
+        sel.close()
 
     def _handle_client(self, conn, addr):
         """Obsluga pojedynczego polaczenia w osobnym watku."""
@@ -196,24 +243,90 @@ class GameServer:
 
         return None
 
+    @property
+    def mcast_family(self):
+        """Rodzina adresow grupy multicast wynika z jej zapisu (':' -> IPv6)."""
+        return socket.AF_INET6 if ":" in self.mcast_group else socket.AF_INET
+
+    def _v6_iface_index(self):
+        """Indeks interfejsu IPv6 z nazwy (np. 'eth0') albo 0 = domyslny."""
+        if not self.iface:
+            return 0
+        try:
+            return socket.if_nametoindex(self.iface)
+        except (OSError, ValueError):
+            return 0
+
+    def _join_multicast(self, sock):
+        """Dolacza gniazdo do grupy multicast (IPv4 lub IPv6).
+
+        Gdy podano ``--iface``, czlonkostwo zakladane jest na konkretnym
+        interfejsie (konieczne w sieciach bez trasy domyslnej, np. host-only).
+        """
+        if self.mcast_family == socket.AF_INET6:
+            group_bin = socket.inet_pton(socket.AF_INET6, self.mcast_group)
+            mreq = group_bin + struct.pack("@I", self._v6_iface_index())
+            opt = getattr(socket, "IPV6_JOIN_GROUP",
+                          getattr(socket, "IPV6_ADD_MEMBERSHIP", 20))
+            sock.setsockopt(socket.IPPROTO_IPV6, opt, mreq)
+        else:
+            group_bin = socket.inet_aton(self.mcast_group)
+            iface_bin = (socket.inet_aton(self.iface) if self.iface
+                         else struct.pack("!I", socket.INADDR_ANY))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            group_bin + iface_bin)
+
+    def _set_multicast_iface(self, sock, fam):
+        """Wskazuje interfejs wyjsciowy dla wysylanego multicastu (jezeli podano).
+
+        Bez tego, w sieci bez trasy domyslnej, ``sendto`` na adres grupy konczy
+        sie bledem ENETUNREACH ('Network is unreachable').
+        """
+        if not self.iface:
+            return
+        if fam == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF,
+                            self._v6_iface_index())
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                            socket.inet_aton(self.iface))
+
     # -- multicast: rozglaszanie ANNOUNCE -----------------------------------
     def _announce_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MCAST_TTL)
+        fam = self.mcast_family
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        if fam == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, MCAST_TTL)
+        else:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MCAST_TTL)
+        try:
+            self._set_multicast_iface(s, fam)
+        except OSError as e:
+            log.warning("Nie mozna ustawic interfejsu multicast (--iface %s): %s",
+                        self.iface, e)
         packet = protocol.encode_announce(self.tcp_port, self.name)
-        log.info("Rozglaszanie ANNOUNCE w grupie %s:%d (co %.1fs)",
-                self.mcast_group, self.mcast_port, ANNOUNCE_INTERVAL)
+        dest = (self.mcast_group, self.mcast_port)
+        log.info("Rozglaszanie ANNOUNCE w grupie %s:%d [%s] (co %.1fs)",
+                self.mcast_group, self.mcast_port,
+                "IPv6" if fam == socket.AF_INET6 else "IPv4", ANNOUNCE_INTERVAL)
+        warned = False
         while not self.stop_event.is_set():
             try:
-                s.sendto(packet, (self.mcast_group, self.mcast_port))
+                s.sendto(packet, dest)
+                warned = False
             except OSError as e:
-                log.warning("Blad rozglaszania ANNOUNCE: %s", e)
+                if not warned:                  # logujemy raz, nie zalewamy logu
+                    log.warning("Blad rozglaszania ANNOUNCE: %s. Podpowiedz: w "
+                                "sieci host-only podaj --iface <ip-karty> albo "
+                                "lacz klienta bezposrednio (--host <adres>).", e)
+                    warned = True
             self.stop_event.wait(ANNOUNCE_INTERVAL)
         s.close()
 
     # -- multicast: odpowiadanie na DISCOVER --------------------------------
     def _discover_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        fam = self.mcast_family
+        s = socket.socket(fam, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             try:
@@ -222,9 +335,7 @@ class GameServer:
                 pass
         try:
             s.bind(("", self.mcast_port))
-            mreq = struct.pack("4sl", socket.inet_aton(self.mcast_group),
-                               socket.INADDR_ANY)
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self._join_multicast(s)
         except OSError as e:
             log.warning("Nie mozna nasluchiwac DISCOVER: %s", e)
             s.close()
@@ -240,7 +351,7 @@ class GameServer:
                 break
             parsed = protocol.parse_datagram(data)
             if parsed and parsed[0] == protocol.T_DISCOVER:
-                log.info("DISCOVER od %s:%d -> odsylam ANNOUNCE", addr[0], addr[1])
+                log.info("DISCOVER od %s -> odsylam ANNOUNCE", addr[0])
                 try:
                     s.sendto(announce, addr)   # odpowiedz unicast
                 except OSError:
@@ -386,7 +497,7 @@ class GameServer:
 
     # -- cykl zycia serwera -------------------------------------------------
     def serve_forever(self):
-        self._setup_tcp()
+        self.tcp_socks = self._make_listening_sockets()
         targets = [self._accept_loop, self._announce_loop,
                    self._discover_loop, self._lobby_controller]
         for fn in targets:
@@ -404,9 +515,9 @@ class GameServer:
 
     def shutdown(self):
         self.stop_event.set()
-        if self.tcp_sock:
+        for s in self.tcp_socks:
             try:
-                self.tcp_sock.close()
+                s.close()
             except OSError:
                 pass
 
@@ -454,16 +565,22 @@ def setup_logging(daemonized, log_file):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Serwer sieciowej gry 'Rosyjska Ruletka'.")
-    p.add_argument("--host", default="0.0.0.0",
-                   help="adres nasluchu TCP (domyslnie 0.0.0.0)")
+    p.add_argument("--host", default="",
+                   help="adres nasluchu TCP (domyslnie puste = wszystkie "
+                        "interfejsy IPv4 i IPv6)")
     p.add_argument("--port", type=int, default=protocol.DEFAULT_TCP_PORT,
                    help="port TCP rozgrywki (domyslnie %d)" % protocol.DEFAULT_TCP_PORT)
     p.add_argument("--name", default=socket.gethostname(),
                    help="nazwa serwera rozglaszana w multicast")
     p.add_argument("--group", default=protocol.DEFAULT_MCAST_GROUP,
-                   help="grupa multicast (domyslnie %s)" % protocol.DEFAULT_MCAST_GROUP)
+                   help="grupa multicast: IPv4 %s lub IPv6 np. %s"
+                        % (protocol.DEFAULT_MCAST_GROUP, protocol.DEFAULT_MCAST_GROUP6))
     p.add_argument("--mcast-port", type=int, default=protocol.DEFAULT_MCAST_PORT,
                    help="port multicast (domyslnie %d)" % protocol.DEFAULT_MCAST_PORT)
+    p.add_argument("--iface", default=None,
+                   help="interfejs multicast: adres IP karty (IPv4) lub nazwa "
+                        "np. eth0 (IPv6). Wymagany w sieci host-only / bez trasy "
+                        "domyslnej")
     p.add_argument("--lobby-timeout", type=int, default=15,
                    help="czas poczekalni od 1. gracza w sekundach (domyslnie 15)")
     p.add_argument("--max-players", type=int, default=0,
@@ -490,7 +607,7 @@ def main(argv=None):
         host=args.host, tcp_port=args.port, name=args.name,
         mcast_group=args.group, mcast_port=args.mcast_port,
         lobby_timeout=args.lobby_timeout, max_players=args.max_players,
-        shot_delay=args.shot_delay,
+        shot_delay=args.shot_delay, iface=args.iface,
     )
     server.serve_forever()
 

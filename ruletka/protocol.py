@@ -48,9 +48,10 @@ ERR_NICK = 1         # bledny pseudonim
 ERR_BUSY = 2         # gra juz trwa / brak miejsc
 
 # Domyslne parametry adresacji -- wspolne dla klienta i serwera.
-DEFAULT_TCP_PORT = 50000        # unicast TCP (rozgrywka)
-DEFAULT_MCAST_GROUP = "239.0.0.1"
-DEFAULT_MCAST_PORT = 50001      # multicast (wyszukiwanie uslugi)
+DEFAULT_TCP_PORT = 50000             # unicast TCP (rozgrywka)
+DEFAULT_MCAST_GROUP = "239.0.0.1"    # grupa multicast IPv4
+DEFAULT_MCAST_GROUP6 = "ff15::1"     # grupa multicast IPv6 (zasieg site-local)
+DEFAULT_MCAST_PORT = 50001           # multicast (wyszukiwanie uslugi)
 
 # Naglowek TLV: 1 bajt typ + 2 bajty dlugosc, big-endian.
 _HEADER = struct.Struct("!BH")

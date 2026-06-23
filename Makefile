@@ -15,6 +15,7 @@ HOST        ?=
 PORT        ?= 50000
 GROUP       ?= 239.0.0.1
 MCAST_PORT  ?= 50001
+IFACE       ?=
 NICK        ?= gracz
 LOBBY       ?= 15
 SHOT_DELAY  ?= 1.0
@@ -49,12 +50,14 @@ check: ## Kompilacja kontrolna wszystkich modulow
 run-server: ## Uruchom serwer (pierwszoplanowo, logi tez na konsole)
 	$(PYTHON) -m ruletka.server --host $(BIND) --port $(PORT) --group $(GROUP) \
 		--mcast-port $(MCAST_PORT) --lobby-timeout $(LOBBY) \
-		--shot-delay $(SHOT_DELAY) --log-file $(LOG)
+		--shot-delay $(SHOT_DELAY) --log-file $(LOG) \
+		$(if $(strip $(IFACE)),--iface $(IFACE),)
 
 daemon: ## Uruchom serwer jako demon (tryb w tle, syslog)
 	$(PYTHON) -m ruletka.server --daemon --host $(BIND) --port $(PORT) \
 		--group $(GROUP) --mcast-port $(MCAST_PORT) --lobby-timeout $(LOBBY) \
-		--shot-delay $(SHOT_DELAY) --log-file $(LOG)
+		--shot-delay $(SHOT_DELAY) --log-file $(LOG) \
+		$(if $(strip $(IFACE)),--iface $(IFACE),)
 	@echo "Demon uruchomiony. Podglad: make logs / make follow ; status: ps aux | grep ruletka"
 
 stop: ## Zatrzymaj dzialajacy serwer
@@ -69,11 +72,13 @@ follow: ## Sledz log na biezaco (Ctrl-C aby przerwac)
 
 # --- klient ----------------------------------------------------------------
 discover: ## Wykryj serwery w sieci (multicast)
-	$(PYTHON) -m ruletka.client --list --group $(GROUP) --mcast-port $(MCAST_PORT)
+	$(PYTHON) -m ruletka.client --list --group $(GROUP) --mcast-port $(MCAST_PORT) \
+		$(if $(strip $(IFACE)),--iface $(IFACE),)
 
 run-client: ## Dolacz jako klient (HOST=ip/nazwa aby pominac multicast)
 ifeq ($(strip $(HOST)),)
-	$(PYTHON) -m ruletka.client --nick $(NICK) --group $(GROUP) --mcast-port $(MCAST_PORT)
+	$(PYTHON) -m ruletka.client --nick $(NICK) --group $(GROUP) \
+		--mcast-port $(MCAST_PORT) $(if $(strip $(IFACE)),--iface $(IFACE),)
 else
 	$(PYTHON) -m ruletka.client --host $(HOST) --port $(PORT) --nick $(NICK)
 endif

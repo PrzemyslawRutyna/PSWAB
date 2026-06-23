@@ -17,18 +17,35 @@ import sys
 import time
 
 from . import protocol
-from .protocol import DEFAULT_MCAST_GROUP, DEFAULT_MCAST_PORT, DEFAULT_TCP_PORT
+from .protocol import (DEFAULT_MCAST_GROUP, DEFAULT_MCAST_GROUP6,
+                       DEFAULT_MCAST_PORT, DEFAULT_TCP_PORT)
 
 
 # ---------------------------------------------------------------------------
-# Wyszukiwanie serwera (multicast)
+# Wyszukiwanie serwera (multicast) -- IPv4 oraz IPv6
 # ---------------------------------------------------------------------------
-def discover_servers(group, mcast_port, timeout):
+def discover_servers(group, mcast_port, timeout, iface=None):
     """Wysyla DISCOVER i zbiera odpowiedzi ANNOUNCE przez *timeout* sekund.
 
-    Zwraca liste krotek ``(nazwa, ip, port_tcp)`` (bez duplikatow).
+    Rodzina adresow wynika z zapisu grupy (':' -> IPv6, np. ff15::1).  Zwraca
+    liste krotek ``(nazwa, host, port_tcp)``, gdzie *host* jest gotowy do
+    polaczenia (dla adresow IPv6 link-local zawiera identyfikator interfejsu,
+    np. ``fe80::1%eth0``).
+
+    *iface* (adres IP karty dla IPv4 lub nazwa np. ``eth0`` dla IPv6) wskazuje
+    interfejs multicastu -- konieczny w sieciach bez trasy domyslnej
+    (np. VirtualBox host-only).  Gdy wyslanie DISCOVER zawiedzie
+    (ENETUNREACH), funkcja nie przerywa -- nadal nasluchuje cyklicznych ANNOUNCE.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    family = socket.AF_INET6 if ":" in group else socket.AF_INET
+
+    def v6_index():
+        try:
+            return socket.if_nametoindex(iface) if iface else 0
+        except (OSError, ValueError):
+            return 0
+
+    s = socket.socket(family, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     if hasattr(socket, "SO_REUSEPORT"):
         try:
@@ -38,16 +55,42 @@ def discover_servers(group, mcast_port, timeout):
     # Dolaczamy do grupy, aby odbierac takze cykliczne ANNOUNCE serwera.
     try:
         s.bind(("", mcast_port))
-        mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        if family == socket.AF_INET6:
+            mreq = socket.inet_pton(socket.AF_INET6, group) + struct.pack("@I", v6_index())
+            opt = getattr(socket, "IPV6_JOIN_GROUP",
+                          getattr(socket, "IPV6_ADD_MEMBERSHIP", 20))
+            s.setsockopt(socket.IPPROTO_IPV6, opt, mreq)
+        else:
+            iface_bin = (socket.inet_aton(iface) if iface
+                         else struct.pack("!I", socket.INADDR_ANY))
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         socket.inet_aton(group) + iface_bin)
     except OSError:
         # Gdy port zajety, mozemy nadal wyslac DISCOVER i sluchac odpowiedzi
         # unicast na efemerycznym porcie.
         s.close()
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = socket.socket(family, socket.SOCK_DGRAM)
 
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-    s.sendto(protocol.encode_discover(), (group, mcast_port))
+    # Wskazanie interfejsu wyjsciowego multicastu (gdy podano).
+    try:
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+            if iface:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, v6_index())
+        else:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            if iface:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                             socket.inet_aton(iface))
+    except OSError:
+        pass
+
+    try:
+        s.sendto(protocol.encode_discover(), (group, mcast_port))
+    except OSError as e:
+        print("Uwaga: nie udalo sie wyslac DISCOVER (%s)." % e)
+        print("  Siec bez trasy multicast (np. host-only). Sprobuj: "
+              "--iface <ip-karty> albo polacz bezposrednio: --host <adres>.")
 
     found = {}
     s.settimeout(0.4)
@@ -62,15 +105,30 @@ def discover_servers(group, mcast_port, timeout):
         parsed = protocol.parse_datagram(data)
         if parsed and parsed[0] == protocol.T_ANNOUNCE:
             port, name = protocol.decode_announce(parsed[1])
-            found[(addr[0], port)] = name
+            host = addr[0]
+            # Dla IPv6 link-local zachowujemy identyfikator interfejsu (scope).
+            if family == socket.AF_INET6 and len(addr) >= 4 and addr[3]:
+                if "%" not in host:
+                    host = "%s%%%d" % (host, addr[3])
+            found[(host, port)] = name
     s.close()
-    return [(name, ip, port) for (ip, port), name in found.items()]
+    return [(name, host, port) for (host, port), name in found.items()]
 
 
 def resolve(host, port):
-    """Rozwiazuje nazwe hosta na adres IPv4 (DNS) -- socket.getaddrinfo()."""
-    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    return infos[0][4]          # (ip, port)
+    """Rozwiazuje nazwe hosta (DNS) -- IPv4 i IPv6 przez socket.getaddrinfo().
+
+    Zwraca liste krotek ``(rodzina, ip)`` znalezionych adresow.
+    """
+    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    out = []
+    seen = set()
+    for family, _stype, _proto, _canon, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip not in seen:
+            seen.add(ip)
+            out.append((family, ip))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -146,14 +204,22 @@ class GamePrinter:
 def choose_server(args):
     """Zwraca (ip, port) serwera na podstawie argumentow lub wyszukiwania."""
     if args.host:
-        print("Rozwiazywanie nazwy '%s' (DNS)..." % args.host)
-        ip, port = resolve(args.host, args.port)
-        print("  -> %s:%d" % (ip, port))
-        return ip, port
+        print("Rozwiazywanie nazwy '%s' (DNS, IPv4/IPv6)..." % args.host)
+        try:
+            addrs = resolve(args.host, args.port)
+        except socket.gaierror as e:
+            print("Blad rozwiazywania nazwy: %s" % e)
+            return None
+        for family, ip in addrs:
+            label = "IPv6" if family == socket.AF_INET6 else "IPv4"
+            print("  -> %s (%s)" % (ip, label))
+        # Zwracamy nazwe -- create_connection sprobuje kolejno wszystkich adresow.
+        return args.host, args.port
 
     print("Wyszukiwanie serwerow w sieci (multicast %s:%d, %ds)..."
           % (args.group, args.mcast_port, args.discover_timeout))
-    servers = discover_servers(args.group, args.mcast_port, args.discover_timeout)
+    servers = discover_servers(args.group, args.mcast_port, args.discover_timeout,
+                               args.iface)
     if not servers:
         print("Nie znaleziono serwerow. Podaj adres recznie opcja --host.")
         return None
@@ -220,9 +286,14 @@ def parse_args(argv=None):
     p.add_argument("--nick", default=None,
                    help="pseudonim gracza (max %d znakow)" % protocol.NICK_MAX)
     p.add_argument("--group", default=DEFAULT_MCAST_GROUP,
-                   help="grupa multicast (domyslnie %s)" % DEFAULT_MCAST_GROUP)
+                   help="grupa multicast: IPv4 %s lub IPv6 np. %s"
+                        % (DEFAULT_MCAST_GROUP, DEFAULT_MCAST_GROUP6))
     p.add_argument("--mcast-port", type=int, default=DEFAULT_MCAST_PORT,
                    help="port multicast (domyslnie %d)" % DEFAULT_MCAST_PORT)
+    p.add_argument("--iface", default=None,
+                   help="interfejs multicast: adres IP karty (IPv4) lub nazwa "
+                        "np. eth0 (IPv6). Wymagany w sieci host-only / bez trasy "
+                        "domyslnej")
     p.add_argument("--discover-timeout", type=float, default=3.0,
                    help="czas wyszukiwania serwerow w sekundach (domyslnie 3)")
     p.add_argument("--list", action="store_true",
@@ -235,7 +306,7 @@ def main(argv=None):
 
     if args.list:
         servers = discover_servers(args.group, args.mcast_port,
-                                   args.discover_timeout)
+                                   args.discover_timeout, args.iface)
         if not servers:
             print("Nie znaleziono serwerow.")
         for name, ip, port in servers:
